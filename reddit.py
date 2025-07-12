@@ -62,46 +62,41 @@ def load_authors_from_txt(files, skip_list=None, skip_bots=True):
 
 def get_account_info(author):
     """
-    Retrieve account status code and birth date.
+    Retrieve account status code, birth date, and last activity date.
 
     Logic:
-    1) Determine status via Reddit API and store status_code.
-    2) If status is active, fetch creation date via the same Reddit API response.
-    3) If status is suspended or deleted, fetch earliest post/comment date via Arctic Shift API.
+    1) Determine status via Reddit API.
+    2) If active, get creation date from Reddit API response.
+    3) If suspended or deleted, get earliest date via Arctic Shift API.
+    4) For all statuses, get last activity via Arctic Shift API (desc).
 
     Returns:
-        status_code (int), birth_date (str)
+        status_code (int), birth_date (str), last_activity (str)
     """
     headers = {'User-Agent': 'AuthorTools/0.1'}
     birth_date = 'Unknown'
+    last_activity = 'Unknown'
 
     # Step 1: Determine status via Reddit API
     try:
         about = session.get(f'https://www.reddit.com/user/{author}/about.json', headers=headers, timeout=5)
         if about.status_code == 200:
             data = about.json().get('data', {})
-            if data.get('is_suspended'):
-                status_code = STATUS_CODES['suspended']
-            else:
-                status_code = STATUS_CODES['active']
+            status_code = STATUS_CODES['suspended'] if data.get('is_suspended') else STATUS_CODES['active']
         elif about.status_code == 404:
             status_code = STATUS_CODES['deleted']
         else:
             status_code = STATUS_CODES['active']
     except requests.RequestException:
         status_code = STATUS_CODES['active']
+        data = {}
 
-    # Step 2: Fetch birth date based on stored status
+    # Step 2: Fetch birth date based on status
     if status_code == STATUS_CODES['active']:
-        # Active: creation date from Reddit API
-        try:
-            ts = data.get('created_utc')
-            if ts:
-                birth_date = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-        except Exception:
-            pass
+        ts = data.get('created_utc')
+        if isinstance(ts, (int, float)):
+            birth_date = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
     else:
-        # Suspended/Deleted: query Arctic Shift posts and comments
         timestamps = []
         for endpoint in [
             f'https://arctic-shift.photon-reddit.com/api/posts/search?author={author}&sort=asc',
@@ -112,33 +107,51 @@ def get_account_info(author):
                 if not resp.ok:
                     continue
                 payload = resp.json()
-                # Support both {'data': [...]} and direct list
-                items = []
-                if isinstance(payload, dict) and 'data' in payload and isinstance(payload['data'], list):
-                    items = payload['data']
-                elif isinstance(payload, list):
-                    items = payload
-                if not items:
-                    continue
-                first = items[0]
-                ts = first.get('created_utc') or first.get('created') or first.get('timestamp')
-                if isinstance(ts, (int, float)):
-                    timestamps.append(datetime.datetime.fromtimestamp(ts))
-                elif isinstance(ts, str):
-                    try:
-                        timestamps.append(datetime.datetime.fromisoformat(ts.rstrip('Z')))
-                    except ValueError:
-                        pass
-            except (requests.RequestException, ValueError):
+                items = payload.get('data', payload) if isinstance(payload, dict) else payload
+                if isinstance(items, list) and items:
+                    ts = items[0].get('created_utc') or items[0].get('created') or items[0].get('timestamp')
+                    if isinstance(ts, (int, float)):
+                        timestamps.append(datetime.datetime.fromtimestamp(ts))
+                    elif isinstance(ts, str):
+                        try:
+                            timestamps.append(datetime.datetime.fromisoformat(ts.rstrip('Z')))
+                        except ValueError:
+                            pass
+            except requests.RequestException:
                 continue
         if timestamps:
             birth_date = min(timestamps).strftime('%Y-%m-%d')
 
-    return status_code, birth_date
+    # Step 3: Fetch last activity (desc) via Arctic Shift
+    last_timestamps = []
+    for endpoint in [
+        f'https://arctic-shift.photon-reddit.com/api/posts/search?author={author}&sort=desc',
+        f'https://arctic-shift.photon-reddit.com/api/comments/search?author={author}&sort=desc'
+    ]:
+        try:
+            resp = session.get(endpoint, timeout=5)
+            if not resp.ok:
+                continue
+            payload = resp.json()
+            items = payload.get('data', payload) if isinstance(payload, dict) else payload
+            if isinstance(items, list) and items:
+                ts = items[0].get('created_utc') or items[0].get('created') or items[0].get('timestamp')
+                if isinstance(ts, (int, float)):
+                    last_timestamps.append(datetime.datetime.fromtimestamp(ts))
+                elif isinstance(ts, str):
+                    try:
+                        last_timestamps.append(datetime.datetime.fromisoformat(ts.rstrip('Z')))
+                    except ValueError:
+                        pass
+        except requests.RequestException:
+            continue
+    if last_timestamps:
+        last_activity = max(last_timestamps).strftime('%Y-%m-%d')
 
+    return status_code, birth_date, last_activity
 
 def get_account_creation_date(author):
-    _, date = get_account_info(author)
+    _, date, _ = get_account_info(author)
     return date
 
 class GUIApp:
@@ -268,14 +281,13 @@ class GUIApp:
         frame = ttk.Frame(popup, padding=10)
         frame.pack(fill='both', expand=True)
 
-        # Treeview table setup
-        columns = ('Username', 'Status', 'Birth Date')
+        # Treeview table setup including Last Activity
+        columns = ('Username', 'Status', 'Birth Date', 'Last Activity')
         tree = ttk.Treeview(frame, columns=columns, show='headings')
-        # Add sorting to headers
+
         def sort_column(tv, col, reverse=False):
             data_list = [(tv.set(child, col), child) for child in tv.get_children('')]
-            # Attempt date parsing for birth date
-            if col == 'Birth Date':
+            if col in ['Birth Date', 'Last Activity']:
                 def parse_date(val):
                     try:
                         return datetime.datetime.strptime(val, '%Y-%m-%d')
@@ -284,17 +296,14 @@ class GUIApp:
                 data_list.sort(key=lambda t: parse_date(t[0]), reverse=reverse)
             else:
                 data_list.sort(key=lambda t: t[0].lower(), reverse=reverse)
-            # Rearrange items
             for index, (_, child) in enumerate(data_list):
                 tv.move(child, '', index)
-            # Reverse sort next time
             tv.heading(col, command=lambda: sort_column(tv, col, not reverse))
 
         for col in columns:
             tree.heading(col, text=col, command=lambda _col=col: sort_column(tree, _col, False))
             tree.column(col, anchor='w')
 
-        # Scrollbar
         scrollbar = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
@@ -302,14 +311,12 @@ class GUIApp:
 
         # Reset status list
         self.status_codes = []
-        # Populate rows
         for author in authors:
-            code, birth_date = get_account_info(author)
+            code, birth_date, last_activity = get_account_info(author)
             self.status_codes.append(code)
             label = STATUS_LABELS.get(code, 'unknown')
-            tree.insert('', 'end', values=(author, label, birth_date))
+            tree.insert('', 'end', values=(author, label, birth_date, last_activity))
 
-        # Double-click to open profile in browser
         def on_double_click(event):
             sel = tree.selection()
             if sel:
