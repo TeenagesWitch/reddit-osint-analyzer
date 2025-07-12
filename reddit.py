@@ -271,8 +271,27 @@ class GUIApp:
         # Treeview table setup
         columns = ('Username', 'Status', 'Birth Date')
         tree = ttk.Treeview(frame, columns=columns, show='headings')
+        # Add sorting to headers
+        def sort_column(tv, col, reverse=False):
+            data_list = [(tv.set(child, col), child) for child in tv.get_children('')]
+            # Attempt date parsing for birth date
+            if col == 'Birth Date':
+                def parse_date(val):
+                    try:
+                        return datetime.datetime.strptime(val, '%Y-%m-%d')
+                    except Exception:
+                        return datetime.datetime.min
+                data_list.sort(key=lambda t: parse_date(t[0]), reverse=reverse)
+            else:
+                data_list.sort(key=lambda t: t[0].lower(), reverse=reverse)
+            # Rearrange items
+            for index, (_, child) in enumerate(data_list):
+                tv.move(child, '', index)
+            # Reverse sort next time
+            tv.heading(col, command=lambda: sort_column(tv, col, not reverse))
+
         for col in columns:
-            tree.heading(col, text=col)
+            tree.heading(col, text=col, command=lambda _col=col: sort_column(tree, _col, False))
             tree.column(col, anchor='w')
 
         # Scrollbar
