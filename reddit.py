@@ -15,7 +15,7 @@ session = requests.Session()
 DEFAULT_SKIPS = {"[deleted]", "automoderator", "thesunflowerseeds", "waitingtobetriggered", "b0trank"}
 
 # Status code mapping
-STATUS_CODES = { 'deleted': 0, 'active': 1, 'suspended': 2 }
+STATUS_CODES = {'deleted': 0, 'active': 1, 'suspended': 2}
 STATUS_LABELS = {v: k for k, v in STATUS_CODES.items()}
 
 
@@ -66,7 +66,7 @@ def get_account_info(author):
 
     Logic:
     1) Determine status via Reddit API and store status_code.
-    2) If status is active, fetch creation date via Reddit API.
+    2) If status is active, fetch creation date via the same Reddit API response.
     3) If status is suspended or deleted, fetch earliest post/comment date via Arctic Shift API.
 
     Returns:
@@ -77,57 +77,62 @@ def get_account_info(author):
 
     # Step 1: Determine status via Reddit API
     try:
-        res = session.get(f'https://www.reddit.com/user/{author}/about.json', headers=headers, timeout=5)
-        if res.status_code == 200:
-            data = res.json().get('data', {})
+        about = session.get(f'https://www.reddit.com/user/{author}/about.json', headers=headers, timeout=5)
+        if about.status_code == 200:
+            data = about.json().get('data', {})
             if data.get('is_suspended'):
                 status_code = STATUS_CODES['suspended']
             else:
                 status_code = STATUS_CODES['active']
-        elif res.status_code == 404:
+        elif about.status_code == 404:
             status_code = STATUS_CODES['deleted']
         else:
             status_code = STATUS_CODES['active']
     except requests.RequestException:
         status_code = STATUS_CODES['active']
 
-    # Step 2: Based on stored status, fetch birth date
+    # Step 2: Fetch birth date based on stored status
     if status_code == STATUS_CODES['active']:
-        # Active: use Reddit created_utc
+        # Active: creation date from Reddit API
         try:
-            data = res.json().get('data', {})
             ts = data.get('created_utc')
             if ts:
                 birth_date = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
         except Exception:
             pass
     else:
-        # Suspended or deleted: use Arctic Shift for earliest timestamp
+        # Suspended/Deleted: query Arctic Shift posts and comments
         timestamps = []
-        endpoints = [
+        for endpoint in [
             f'https://arctic-shift.photon-reddit.com/api/posts/search?author={author}&sort=asc',
             f'https://arctic-shift.photon-reddit.com/api/comments/search?author={author}&sort=asc'
-        ]
-        for url in endpoints:
+        ]:
             try:
-                r = session.get(url, timeout=5)
-                if r.ok:
-                    items = r.json()
-                    if isinstance(items, list) and items:
-                        first = items[0]
-                        ts = first.get('created_utc') or first.get('created') or first.get('timestamp')
-                        if isinstance(ts, (int, float)):
-                            timestamps.append(datetime.datetime.fromtimestamp(ts))
-                        elif isinstance(ts, str):
-                            try:
-                                timestamps.append(datetime.datetime.fromisoformat(ts.rstrip('Z')))
-                            except ValueError:
-                                pass
-            except requests.RequestException:
+                resp = session.get(endpoint, timeout=5)
+                if not resp.ok:
+                    continue
+                payload = resp.json()
+                # Support both {'data': [...]} and direct list
+                items = []
+                if isinstance(payload, dict) and 'data' in payload and isinstance(payload['data'], list):
+                    items = payload['data']
+                elif isinstance(payload, list):
+                    items = payload
+                if not items:
+                    continue
+                first = items[0]
+                ts = first.get('created_utc') or first.get('created') or first.get('timestamp')
+                if isinstance(ts, (int, float)):
+                    timestamps.append(datetime.datetime.fromtimestamp(ts))
+                elif isinstance(ts, str):
+                    try:
+                        timestamps.append(datetime.datetime.fromisoformat(ts.rstrip('Z')))
+                    except ValueError:
+                        pass
+            except (requests.RequestException, ValueError):
                 continue
         if timestamps:
-            earliest = min(timestamps)
-            birth_date = earliest.strftime('%Y-%m-%d')
+            birth_date = min(timestamps).strftime('%Y-%m-%d')
 
     return status_code, birth_date
 
