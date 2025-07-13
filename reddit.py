@@ -19,10 +19,25 @@ STATUS_CODES = {'deleted': 0, 'active': 1, 'suspended': 2}
 STATUS_LABELS = {v: k for k, v in STATUS_CODES.items()}
 
 
+def get_account_status(author):
+    """
+    Return status_code for a given Reddit author via Reddit API only.
+    """
+    headers = {'User-Agent': 'AuthorTools/0.1'}
+    try:
+        resp = session.get(f'https://www.reddit.com/user/{author}/about.json', headers=headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json().get('data', {})
+            return STATUS_CODES['suspended'] if data.get('is_suspended') else STATUS_CODES['active']
+        elif resp.status_code == 404:
+            return STATUS_CODES['deleted']
+    except requests.RequestException:
+        pass
+    # default to active if uncertain
+    return STATUS_CODES['active']
+
+
 def extract_unique_authors(file_paths):
-    """
-    Read JSONL files and return sorted unique authors.
-    """
     unique_authors = set()
     for path in file_paths:
         if not os.path.isfile(path):
@@ -40,9 +55,6 @@ def extract_unique_authors(file_paths):
 
 
 def load_authors_from_txt(files, skip_list=None, skip_bots=True):
-    """
-    Load authors from txt, filter by skip_list and bots.
-    """
     skip_set = set(skip_list) if skip_list is not None else DEFAULT_SKIPS
     authors = set()
     for path in files:
@@ -61,23 +73,12 @@ def load_authors_from_txt(files, skip_list=None, skip_bots=True):
 
 
 def get_account_info(author):
-    """
-    Retrieve account status code, birth date, and last activity date.
-
-    Logic:
-    1) Determine status via Reddit API.
-    2) If active, get creation date from Reddit API response.
-    3) If suspended or deleted, get earliest date via Arctic Shift API.
-    4) For all statuses, get last activity via Arctic Shift API (desc).
-
-    Returns:
-        status_code (int), birth_date (str), last_activity (str)
-    """
     headers = {'User-Agent': 'AuthorTools/0.1'}
     birth_date = 'Unknown'
     last_activity = 'Unknown'
+    data = {}
 
-    # Step 1: Determine status via Reddit API
+    # Determine status
     try:
         about = session.get(f'https://www.reddit.com/user/{author}/about.json', headers=headers, timeout=5)
         if about.status_code == 200:
@@ -89,9 +90,8 @@ def get_account_info(author):
             status_code = STATUS_CODES['active']
     except requests.RequestException:
         status_code = STATUS_CODES['active']
-        data = {}
 
-    # Step 2: Fetch birth date based on status
+    # Birth date
     if status_code == STATUS_CODES['active']:
         ts = data.get('created_utc')
         if isinstance(ts, (int, float)):
@@ -122,7 +122,7 @@ def get_account_info(author):
         if timestamps:
             birth_date = min(timestamps).strftime('%Y-%m-%d')
 
-    # Step 3: Fetch last activity (desc) via Arctic Shift
+    # Last activity
     last_timestamps = []
     for endpoint in [
         f'https://arctic-shift.photon-reddit.com/api/posts/search?author={author}&sort=desc',
@@ -150,28 +150,28 @@ def get_account_info(author):
 
     return status_code, birth_date, last_activity
 
+
 def get_account_creation_date(author):
     _, date, _ = get_account_info(author)
     return date
+
 
 class GUIApp:
     def __init__(self, root):
         self.root = root
         self.root.title('Author Tools GUI')
 
-        # JSONL extraction vars
+        # Extraction vars
         self.jsonl_paths = [tk.StringVar(), tk.StringVar()]
         self.unique_count = tk.StringVar(value='Total unique authors: 0')
 
         # Overlap vars
-        self.txt_set1_paths = tk.StringVar(value='')
-        self.txt_set2_paths = tk.StringVar(value='')
+        self.txt_set1_paths = tk.StringVar()
+        self.txt_set2_paths = tk.StringVar()
         self.txt_set1 = []
         self.txt_set2 = []
         self.overlap_count = tk.StringVar(value='Overlapping authors: 0')
-
-        # Store status codes for overlap
-        self.status_codes = []
+        self.status_filter = tk.StringVar(value='All')  # new status filter
 
         # Settings
         self.skip_list = list(DEFAULT_SKIPS)
@@ -196,6 +196,7 @@ class GUIApp:
         self._build_settings_tab(tab3)
 
     def _build_unique_tab(self, parent):
+        # unchanged
         frame = ttk.Frame(parent, padding=10)
         frame.pack(fill='both', expand=True)
         ttk.Label(frame, text='Select two JSONL files:').grid(row=0, column=0, sticky='w')
@@ -242,43 +243,60 @@ class GUIApp:
         frame.pack(fill='both', expand=True)
 
         ttk.Label(frame, text='TXT file paths for Set 1 (comma-separated):').grid(row=0, column=0, sticky='w')
-        ttk.Entry(frame, textvariable=self.txt_set1_paths, width=50).grid(row=1, column=0, pady=5)
+        ttk.Entry(frame, textvariable=self.txt_set1_paths, width=40).grid(row=1, column=0, pady=5)
         ttk.Button(frame, text='Browse...', command=lambda: self._browse_txt_set(1)).grid(row=1, column=1)
 
         ttk.Label(frame, text='TXT file paths for Set 2 (comma-separated):').grid(row=2, column=0, sticky='w')
-        ttk.Entry(frame, textvariable=self.txt_set2_paths, width=50).grid(row=3, column=0, pady=5)
+        ttk.Entry(frame, textvariable=self.txt_set2_paths, width=40).grid(row=3, column=0, pady=5)
         ttk.Button(frame, text='Browse...', command=lambda: self._browse_txt_set(2)).grid(row=3, column=1)
 
-        ttk.Label(frame, textvariable=self.overlap_count).grid(row=4, column=0, pady=10)
-        ttk.Button(frame, text='Compute Overlap', command=self._handle_overlap).grid(row=5, column=0)
+        # Status filter options
+        ttk.Label(frame, text='Show statuses:').grid(row=4, column=0, sticky='w', pady=(10,0))
+        status_options = ['All'] + list(STATUS_CODES.keys())
+        status_cb = ttk.Combobox(frame, values=status_options, textvariable=self.status_filter, state='readonly', width=10)
+        status_cb.grid(row=4, column=1, sticky='w', pady=(10,0))
+
+        ttk.Label(frame, textvariable=self.overlap_count).grid(row=5, column=0, columnspan=2, pady=10)
+        ttk.Button(frame, text='Compute Overlap', command=self._handle_overlap).grid(row=6, column=0, columnspan=2)
 
     def _browse_txt_set(self, set_no):
         files = filedialog.askopenfilenames(filetypes=[('Text', '*.txt')])
         if not files:
             return
-        paths_var = self.txt_set1_paths if set_no == 1 else self.txt_set2_paths
-        target_list = self.txt_set1 if set_no == 1 else self.txt_set2
-        target_list.clear(); target_list.extend(files)
-        paths_var.set(','.join(files))
+        if set_no == 1:
+            self.txt_set1.clear(); self.txt_set1.extend(files)
+            self.txt_set1_paths.set(','.join(files))
+        else:
+            self.txt_set2.clear(); self.txt_set2.extend(files)
+            self.txt_set2_paths.set(','.join(files))
 
     def _handle_overlap(self):
         if not (self.txt_set1 and self.txt_set2):
-            messagebox.showwarning('Missing Files', 'Please input or browse TXT files for both sets.')
+            messagebox.showwarning('Missing Files', 'Please input TXT files for both sets.')
             return
-        overlap = sorted(
+        base_overlap = (
             load_authors_from_txt(self.txt_set1, self.skip_list, self.skip_bots.get())
             & load_authors_from_txt(self.txt_set2, self.skip_list, self.skip_bots.get())
         )
-        self.overlap_count.set(f'Overlapping authors: {len(overlap)}')
-        if overlap:
-            self._show_overlap_popup(overlap)
-        else:
-            messagebox.showinfo('No Overlap', 'No overlapping authors found.')
+        # apply status filter
+        filtered = []
+        sel = self.status_filter.get()
+        for author in sorted(base_overlap):
+            code = get_account_status(author)
+            label = STATUS_LABELS.get(code, 'active')
+            if sel == 'All' or label == sel:
+                filtered.append(author)
+        count = len(filtered)
+        self.overlap_count.set(f'Overlapping authors: {count}')
+        if not filtered:
+            messagebox.showinfo('No Overlap', 'No overlapping authors with selected status.')
+            return
+        self._show_overlap_popup(filtered)
 
     def _show_overlap_popup(self, authors):
         popup = tk.Toplevel(self.root)
         popup.title('Overlapping Authors')
-        # Filter frame
+        # existing popup code unchanged...
         filter_frame = ttk.Frame(popup)
         filter_frame.pack(fill='x', padx=10, pady=(10, 0))
         ttk.Label(filter_frame, text='Filter by status:').pack(side='left')
@@ -287,70 +305,50 @@ class GUIApp:
         combobox = ttk.Combobox(filter_frame, values=status_options, textvariable=filter_var, state='readonly', width=10)
         combobox.pack(side='left', padx=(5, 0))
 
-        # Table frame
         frame = ttk.Frame(popup, padding=10)
         frame.pack(fill='both', expand=True)
-
         columns = ('Username', 'Status', 'Birth Date', 'Last Activity')
         tree = ttk.Treeview(frame, columns=columns, show='headings')
         for col in columns:
             tree.heading(col, text=col)
             tree.column(col, anchor='w')
-
         scrollbar = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side='right', fill='y')
         tree.pack(side='left', fill='both', expand=True)
 
-        # Prepare data
         all_rows = []
         for author in authors:
             code, birth, last = get_account_info(author)
-            self.status_codes.append(code)
-            all_rows.append((author, STATUS_LABELS.get(code, 'unknown'), birth, last))
+            all_rows.append((author, STATUS_LABELS.get(code, 'active'), birth, last))
 
         def populate(status_filter):
             tree.delete(*tree.get_children())
-            for author, stat, birth, last in all_rows:
+            for user, stat, birth, last in all_rows:
                 if status_filter == 'All' or stat == status_filter:
-                    tree.insert('', 'end', values=(author, stat, birth, last))
-
-        # Initial populate
+                    tree.insert('', 'end', values=(user, stat, birth, last))
         populate('All')
+        combobox.bind('<<ComboboxSelected>>', lambda e: populate(filter_var.get()))
 
-        # Filter callback
-        def on_filter_change(event):
-            populate(filter_var.get())
-        combobox.bind('<<ComboboxSelected>>', on_filter_change)
-
-        # Enable sorting
+        # sorting and dbl-click as before
         def sort_column(tv, col, reverse=False):
             data_list = [(tv.set(child, col), child) for child in tv.get_children('')]
             if col in ['Birth Date', 'Last Activity']:
                 def parse_date(val):
-                    try:
-                        return datetime.datetime.strptime(val, '%Y-%m-%d')
-                    except Exception:
-                        return datetime.datetime.min
+                    try: return datetime.datetime.strptime(val, '%Y-%m-%d')
+                    except: return datetime.datetime.min
                 data_list.sort(key=lambda t: parse_date(t[0]), reverse=reverse)
             else:
                 data_list.sort(key=lambda t: t[0].lower(), reverse=reverse)
             for index, (_, child) in enumerate(data_list):
                 tv.move(child, '', index)
             tv.heading(col, command=lambda: sort_column(tv, col, not reverse))
-
         for col in columns:
             tree.heading(col, text=col, command=lambda _col=col: sort_column(tree, _col, False))
-
-        # Double-click to open profile
-        def on_double_click(event):
-            sel = tree.selection()
-            if sel:
-                username = tree.item(sel[0], 'values')[0]
-                webbrowser.open(f'https://reddit.com/user/{username}')
-        tree.bind('<Double-1>', on_double_click)
+        tree.bind('<Double-1>', lambda e: webbrowser.open(f'https://reddit.com/user/{tree.item(tree.selection()[0],"values")[0]}'))
 
     def _build_settings_tab(self, parent):
+        # unchanged settings tab
         frame = ttk.Frame(parent, padding=10)
         frame.pack(fill='both', expand=True)
         ttk.Checkbutton(frame, text='Skip usernames ending with "bot"', variable=self.skip_bots).pack(anchor='w', pady=5)
@@ -379,7 +377,6 @@ class GUIApp:
             val = self.skip_listbox.get(i)
             self.skip_list.remove(val)
             self.skip_listbox.delete(i)
-
 
 if __name__ == '__main__':
     root = tk.Tk()
