@@ -2,45 +2,43 @@
 import threading
 import json
 import os
+import datetime
 import webbrowser
 import requests
-import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Persistent HTTP session to reduce overhead
-session = requests.Session()
+# --- Configuration / constants ---
+SESSION = requests.Session()
+SESSION.headers.update({'User-Agent': 'AuthorTools/0.1'})
+REQUEST_TIMEOUT = 6  # seconds
+MAX_WORKERS = 10  # number of concurrent threads for fetching
 
-# Skip list file path
 SKIP_LIST_FILE = 'skip_list.txt'
 
-def load_skip_list():
-    if not os.path.isfile(SKIP_LIST_FILE):
-        # Create file with some defaults if missing
-        with open(SKIP_LIST_FILE, 'w', encoding='utf-8') as f:
-            f.write("[deleted]\nautomoderator\nthesunflowerseeds\nwaitingtobetriggered\nb0trank\n")
-    with open(SKIP_LIST_FILE, 'r', encoding='utf-8') as f:
-        return set(line.strip().lower() for line in f if line.strip())
+# --- Helper functions (re-usable) ---
 
-def save_skip_list(skip_list):
-    with open(SKIP_LIST_FILE, 'w', encoding='utf-8') as f:
-        for item in sorted(skip_list):
-            f.write(item + '\n')
+def load_skip_list(path=SKIP_LIST_FILE):
+    """Load or create a skip-list file and return a set of lowercase usernames."""
+    if not os.path.isfile(path):
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("[deleted]\nautomoderator\n")
+    with open(path, 'r', encoding='utf-8') as f:
+        return set(line.strip().lower() for line in f if line.strip())
 
 DEFAULT_SKIPS = load_skip_list()
 
-# Status code mapping
 STATUS_CODES = {'deleted': 0, 'active': 1, 'suspended': 2}
 STATUS_LABELS = {v: k for k, v in STATUS_CODES.items()}
 
 
-def get_account_status(author):
+def get_account_status(author: str) -> int:
+    """Return status_code for a Reddit username using the Reddit about endpoint.
+    Returns STATUS_CODES['deleted'] if 404, suspended if flagged, otherwise active.
     """
-    Return status_code for a given Reddit author via Reddit API only.
-    """
-    headers = {'User-Agent': 'AuthorTools/0.1'}
     try:
-        resp = session.get(f'https://www.reddit.com/user/{author}/about.json', headers=headers, timeout=5)
+        resp = SESSION.get(f'https://www.reddit.com/user/{author}/about.json', timeout=REQUEST_TIMEOUT)
         if resp.status_code == 200:
             data = resp.json().get('data', {})
             return STATUS_CODES['suspended'] if data.get('is_suspended') else STATUS_CODES['active']
@@ -48,54 +46,38 @@ def get_account_status(author):
             return STATUS_CODES['deleted']
     except requests.RequestException:
         pass
-    # default to active if uncertain
     return STATUS_CODES['active']
 
 
-def extract_unique_authors(file_paths):
-    unique_authors = set()
-    for path in file_paths:
-        if not os.path.isfile(path):
-            continue
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    data = json.loads(line)
-                    author = data.get('author')
-                    if author:
-                        unique_authors.add(author)
-                except json.JSONDecodeError:
-                    continue
-    return sorted(unique_authors)
+def _try_parse_timestamp_to_date(ts) -> datetime.date | None:
+    """Accept int timestamps (seconds) or ISO strings and return date or None."""
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        try:
+            return datetime.datetime.fromtimestamp(ts).date()
+        except Exception:
+            return None
+    if isinstance(ts, str):
+        try:
+            # remove trailing Z
+            return datetime.datetime.fromisoformat(ts.rstrip('Z')).date()
+        except Exception:
+            return None
+    return None
 
 
-def load_authors_from_txt(files, skip_list=None, skip_bots=True):
-    skip_set = set(skip_list) if skip_list is not None else DEFAULT_SKIPS
-    authors = set()
-    for path in files:
-        if not os.path.isfile(path):
-            continue
-        with open(path, 'r', encoding='utf-8') as f:
-            for line in f:
-                author = line.strip()
-                if not author:
-                    continue
-                lower = author.lower()
-                if lower in skip_set or (skip_bots and lower.endswith('bot')):
-                    continue
-                authors.add(author)
-    return authors
-
-
-def get_account_info(author):
-    headers = {'User-Agent': 'AuthorTools/0.1'}
+def get_account_info(author: str) -> tuple:
+    """Return (status_code, creation_date_str or 'Unknown', last_activity_str or 'Unknown').
+    Uses Reddit about.json where possible; falls back to Photon endpoints to find earliest post/comment.
+    """
     birth_date = 'Unknown'
     last_activity = 'Unknown'
     data = {}
 
-    # Determine status
+    # Try official about endpoint first
     try:
-        about = session.get(f'https://www.reddit.com/user/{author}/about.json', headers=headers, timeout=5)
+        about = SESSION.get(f'https://www.reddit.com/user/{author}/about.json', timeout=REQUEST_TIMEOUT)
         if about.status_code == 200:
             data = about.json().get('data', {})
             status_code = STATUS_CODES['suspended'] if data.get('is_suspended') else STATUS_CODES['active']
@@ -106,91 +88,76 @@ def get_account_info(author):
     except requests.RequestException:
         status_code = STATUS_CODES['active']
 
-    # Birth date
+    # If active and created_utc present use it
     if status_code == STATUS_CODES['active']:
         ts = data.get('created_utc')
-        if isinstance(ts, (int, float)):
-            birth_date = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-    else:
+        dt = _try_parse_timestamp_to_date(ts)
+        if dt:
+            birth_date = dt.strftime('%Y-%m-%d')
+
+    # If deleted or missing birth info, try Photon endpoints (may return posts/comments)
+    if birth_date == 'Unknown':
         timestamps = []
-        for endpoint in [
+        for endpoint in (
             f'https://arctic-shift.photon-reddit.com/api/posts/search?author={author}&sort=asc',
-            f'https://arctic-shift.photon-reddit.com/api/comments/search?author={author}&sort=asc'
-        ]:
+            f'https://arctic-shift.photon-reddit.com/api/comments/search?author={author}&sort=asc',
+        ):
             try:
-                resp = session.get(endpoint, timeout=5)
+                resp = SESSION.get(endpoint, timeout=REQUEST_TIMEOUT)
                 if not resp.ok:
                     continue
                 payload = resp.json()
                 items = payload.get('data', payload) if isinstance(payload, dict) else payload
                 if isinstance(items, list) and items:
                     ts = items[0].get('created_utc') or items[0].get('created') or items[0].get('timestamp')
-                    if isinstance(ts, (int, float)):
-                        timestamps.append(datetime.datetime.fromtimestamp(ts))
-                    elif isinstance(ts, str):
-                        try:
-                            timestamps.append(datetime.datetime.fromisoformat(ts.rstrip('Z')))
-                        except ValueError:
-                            pass
+                    dt = _try_parse_timestamp_to_date(ts)
+                    if dt:
+                        timestamps.append(dt)
             except requests.RequestException:
                 continue
         if timestamps:
             birth_date = min(timestamps).strftime('%Y-%m-%d')
 
-    # Last activity
-    last_timestamps = []
-    for endpoint in [
+    # Last activity similar, request descending
+    last_ts = []
+    for endpoint in (
         f'https://arctic-shift.photon-reddit.com/api/posts/search?author={author}&sort=desc',
-        f'https://arctic-shift.photon-reddit.com/api/comments/search?author={author}&sort=desc'
-    ]:
+        f'https://arctic-shift.photon-reddit.com/api/comments/search?author={author}&sort=desc',
+    ):
         try:
-            resp = session.get(endpoint, timeout=5)
+            resp = SESSION.get(endpoint, timeout=REQUEST_TIMEOUT)
             if not resp.ok:
                 continue
             payload = resp.json()
             items = payload.get('data', payload) if isinstance(payload, dict) else payload
             if isinstance(items, list) and items:
                 ts = items[0].get('created_utc') or items[0].get('created') or items[0].get('timestamp')
-                if isinstance(ts, (int, float)):
-                    last_timestamps.append(datetime.datetime.fromtimestamp(ts))
-                elif isinstance(ts, str):
-                    try:
-                        last_timestamps.append(datetime.datetime.fromisoformat(ts.rstrip('Z')))
-                    except ValueError:
-                        pass
+                dt = _try_parse_timestamp_to_date(ts)
+                if dt:
+                    last_ts.append(dt)
         except requests.RequestException:
             continue
-    if last_timestamps:
-        last_activity = max(last_timestamps).strftime('%Y-%m-%d')
+    if last_ts:
+        last_activity = max(last_ts).strftime('%Y-%m-%d')
 
     return status_code, birth_date, last_activity
 
 
-def get_account_creation_date(author):
+def get_account_creation_date(author: str) -> str:
+    """Convenience wrapper returning the creation date string (YYYY-MM-DD) or 'Unknown'."""
     _, date, _ = get_account_info(author)
     return date
 
 
+# --- GUI Application ---
 class GUIApp:
     def __init__(self, root):
         self.root = root
-        self.root.title('Author Tools GUI')
+        self.root.title('Author Tools GUI - Creation Year Distribution')
 
-        # Extraction vars
-        self.jsonl_paths = [tk.StringVar(), tk.StringVar()]
-        self.unique_count = tk.StringVar(value='Total unique authors: 0')
-
-        # Overlap vars
-        self.txt_set1_paths = tk.StringVar()
-        self.txt_set2_paths = tk.StringVar()
-        self.txt_set1 = []
-        self.txt_set2 = []
-        self.overlap_count = tk.StringVar(value='Overlapping authors: 0')
-        self.status_filter = tk.StringVar(value='All')  # new status filter
-
-        # Settings
+        # State
         self.skip_list = list(DEFAULT_SKIPS)
-        self.skip_bots = tk.BooleanVar(value=True)
+        self.skip_bots_var = tk.BooleanVar(value=True)
 
         self._build_ui()
 
@@ -198,202 +165,230 @@ class GUIApp:
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill='both', expand=True)
 
-        tab1 = ttk.Frame(notebook)
-        notebook.add(tab1, text='Extract Unique Authors')
-        self._build_unique_tab(tab1)
+        # Existing tabs could be re-used; here we add only the new tab requested
+        tab = ttk.Frame(notebook)
+        notebook.add(tab, text='Creation Year Distribution')
+        self._build_creation_tab(tab)
 
-        tab2 = ttk.Frame(notebook)
-        notebook.add(tab2, text='Find Overlapping Authors')
-        self._build_overlap_tab(tab2)
-
-        tab3 = ttk.Frame(notebook)
-        notebook.add(tab3, text='Settings')
-        self._build_settings_tab(tab3)
-
-    def _build_unique_tab(self, parent):
-        # unchanged
-        frame = ttk.Frame(parent, padding=10)
+    def _build_creation_tab(self, parent):
+        frame = ttk.Frame(parent, padding=12)
         frame.pack(fill='both', expand=True)
-        ttk.Label(frame, text='Select two JSONL files:').grid(row=0, column=0, sticky='w')
-        for i in range(2):
-            ttk.Entry(frame, textvariable=self.jsonl_paths[i], width=50).grid(row=i+1, column=0, pady=5)
-            ttk.Button(frame, text='Browse...', command=lambda idx=i: self._browse_jsonl(idx)).grid(row=i+1, column=1)
-        ttk.Label(frame, textvariable=self.unique_count).grid(row=3, column=0, pady=10)
-        self.extract_btn = ttk.Button(frame, text='Extract & Save', command=self._handle_unique_async)
-        self.extract_btn.grid(row=4, column=0, columnspan=2, pady=5)
-        self.progress = ttk.Progressbar(frame, mode='indeterminate')
-        self.progress.grid(row=5, column=0, columnspan=2, sticky='ew')
 
-    def _browse_jsonl(self, idx):
-        path = filedialog.askopenfilename(filetypes=[('JSONL files', '*.jsonl')])
+        # File selection
+        top = ttk.Frame(frame)
+        top.pack(fill='x', pady=(0,8))
+        ttk.Label(top, text='Usernames TXT file (one username per line):').pack(side='left')
+        self.creation_txt_path = tk.StringVar()
+        ttk.Entry(top, textvariable=self.creation_txt_path, width=60).pack(side='left', padx=8)
+        ttk.Button(top, text='Browse...', command=self._browse_creation_txt).pack(side='left')
+
+        # Controls
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill='x', pady=(0,8))
+        self.analyze_btn = ttk.Button(ctrl, text='Analyze', command=self._start_analyze)
+        self.analyze_btn.pack(side='left')
+        self.progress = ttk.Progressbar(ctrl, mode='determinate', length=300)
+        self.progress.pack(side='left', padx=8)
+        ttk.Checkbutton(ctrl, text='Skip usernames ending with "bot"', variable=self.skip_bots_var).pack(side='left', padx=8)
+
+        # Distribution & filter area
+        mid = ttk.Frame(frame)
+        mid.pack(fill='both', expand=True)
+
+        # Left: Tree showing distribution
+        left = ttk.Frame(mid)
+        left.pack(side='left', fill='both', expand=True)
+        ttk.Label(left, text='Year Distribution').pack(anchor='w')
+        self.dist_columns = ('Year', 'Count')
+        self.dist_tree = ttk.Treeview(left, columns=self.dist_columns, show='headings', height=12)
+        for c in self.dist_columns:
+            self.dist_tree.heading(c, text=c)
+            self.dist_tree.column(c, anchor='w')
+        self.dist_tree.pack(fill='both', expand=True, padx=(0,8))
+
+        # Right: Detail tree + dropdown filter
+        right = ttk.Frame(mid)
+        right.pack(side='left', fill='both', expand=True)
+        filter_frame = ttk.Frame(right)
+        filter_frame.pack(fill='x')
+        ttk.Label(filter_frame, text='Filter by year:').pack(side='left')
+        self.year_var = tk.StringVar(value='All')
+        self.year_dropdown = ttk.Combobox(filter_frame, values=['All'], textvariable=self.year_var, state='readonly', width=12)
+        self.year_dropdown.pack(side='left', padx=6)
+        ttk.Button(filter_frame, text='Export Filtered', command=self._export_filtered).pack(side='left', padx=6)
+
+        ttk.Label(right, text='Usernames (filtered)').pack(anchor='w', pady=(6,0))
+        detail_cols = ('Username', 'Creation Date', 'Status')
+        self.detail_tree = ttk.Treeview(right, columns=detail_cols, show='headings', height=12)
+        for c in detail_cols:
+            self.detail_tree.heading(c, text=c)
+            self.detail_tree.column(c, anchor='w')
+        self.detail_tree.pack(fill='both', expand=True)
+
+        # Bind dropdown
+        self.year_dropdown.bind('<<ComboboxSelected>>', lambda e: self._apply_year_filter())
+
+        # Store fetched results
+        self._all_results = []  # list of dicts: {'username','date','year','status'}
+
+        # Double-click opens user profile
+        self.detail_tree.bind('<Double-1>', self._on_double_click_user)
+
+    def _browse_creation_txt(self):
+        path = filedialog.askopenfilename(filetypes=[('Text files', '*.txt')])
         if path:
-            self.jsonl_paths[idx].set(path)
+            self.creation_txt_path.set(path)
 
-    def _handle_unique_async(self):
-        paths = [v.get() for v in self.jsonl_paths]
-        if not all(os.path.isfile(p) for p in paths):
-            messagebox.showerror('Error', 'Select valid JSONL files.')
+    def _start_analyze(self):
+        path = self.creation_txt_path.get()
+        if not path or not os.path.isfile(path):
+            messagebox.showerror('Missing file', 'Select a valid .txt file containing usernames.')
             return
-        save_path = filedialog.asksaveasfilename(defaultextension='.txt', filetypes=[('Text', '*.txt')])
-        if not save_path:
+        # read usernames
+        usernames = []
+        skip_set = set(self.skip_list)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    u = line.strip()
+                    if not u:
+                        continue
+                    if self.skip_bots_var.get() and u.lower().endswith('bot'):
+                        continue
+                    if u.lower() in skip_set:
+                        continue
+                    usernames.append(u)
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to read file: {e}')
             return
-        self.extract_btn.config(state='disabled')
-        self.progress.start(10)
-        def task():
-            authors = extract_unique_authors(paths)
-            with open(save_path, 'w', encoding='utf-8') as f:
-                for a in authors:
-                    f.write(a + '\n')
-            self.root.after(0, lambda: self._on_unique_done(len(authors), save_path))
-        threading.Thread(target=task, daemon=True).start()
 
-    def _on_unique_done(self, count, path):
-        self.progress.stop()
-        self.extract_btn.config(state='normal')
-        self.unique_count.set(f'Total unique authors: {count}')
-        messagebox.showinfo('Saved', f'Saved to {path}')
-
-    def _build_overlap_tab(self, parent):
-        frame = ttk.Frame(parent, padding=10)
-        frame.pack(fill='both', expand=True)
-
-        ttk.Label(frame, text='TXT file paths for Set 1 (comma-separated):').grid(row=0, column=0, sticky='w')
-        ttk.Entry(frame, textvariable=self.txt_set1_paths, width=40).grid(row=1, column=0, pady=5)
-        ttk.Button(frame, text='Browse...', command=lambda: self._browse_txt_set(1)).grid(row=1, column=1)
-
-        ttk.Label(frame, text='TXT file paths for Set 2 (comma-separated):').grid(row=2, column=0, sticky='w')
-        ttk.Entry(frame, textvariable=self.txt_set2_paths, width=40).grid(row=3, column=0, pady=5)
-        ttk.Button(frame, text='Browse...', command=lambda: self._browse_txt_set(2)).grid(row=3, column=1)
-
-        # Status filter options
-        ttk.Label(frame, text='Show statuses:').grid(row=4, column=0, sticky='w', pady=(10,0))
-        status_options = ['All'] + list(STATUS_CODES.keys())
-        status_cb = ttk.Combobox(frame, values=status_options, textvariable=self.status_filter, state='readonly', width=10)
-        status_cb.grid(row=4, column=1, sticky='w', pady=(10,0))
-
-        ttk.Label(frame, textvariable=self.overlap_count).grid(row=5, column=0, columnspan=2, pady=10)
-        ttk.Button(frame, text='Compute Overlap', command=self._handle_overlap).grid(row=6, column=0, columnspan=2)
-
-    def _browse_txt_set(self, set_no):
-        files = filedialog.askopenfilenames(filetypes=[('Text', '*.txt')])
-        if not files:
+        if not usernames:
+            messagebox.showinfo('No users', 'No usernames found after applying skip rules.')
             return
-        if set_no == 1:
-            self.txt_set1.clear(); self.txt_set1.extend(files)
-            self.txt_set1_paths.set(','.join(files))
-        else:
-            self.txt_set2.clear(); self.txt_set2.extend(files)
-            self.txt_set2_paths.set(','.join(files))
 
-    def _handle_overlap(self):
-        if not (self.txt_set1 and self.txt_set2):
-            messagebox.showwarning('Missing Files', 'Please input TXT files for both sets.')
-            return
-        base_overlap = (
-            load_authors_from_txt(self.txt_set1, self.skip_list, self.skip_bots.get())
-            & load_authors_from_txt(self.txt_set2, self.skip_list, self.skip_bots.get())
-        )
-        # apply status filter
-        filtered = []
-        sel = self.status_filter.get()
-        for author in sorted(base_overlap):
-            code = get_account_status(author)
-            label = STATUS_LABELS.get(code, 'active')
-            if sel == 'All' or label == sel:
-                filtered.append(author)
-        count = len(filtered)
-        self.overlap_count.set(f'Overlapping authors: {count}')
-        if not filtered:
-            messagebox.showinfo('No Overlap', 'No overlapping authors with selected status.')
-            return
-        self._show_overlap_popup(filtered)
+        # Disable analyze button and run background fetch
+        self.analyze_btn.config(state='disabled')
+        self.progress.config(maximum=len(usernames), value=0)
+        self._all_results.clear()
+        threading.Thread(target=self._fetch_creation_dates_thread, args=(usernames,), daemon=True).start()
 
-    def _show_overlap_popup(self, authors):
-        popup = tk.Toplevel(self.root)
-        popup.title('Overlapping Authors')
-        # existing popup code unchanged...
-        filter_frame = ttk.Frame(popup)
-        filter_frame.pack(fill='x', padx=10, pady=(10, 0))
-        ttk.Label(filter_frame, text='Filter by status:').pack(side='left')
-        status_options = ['All'] + list(STATUS_CODES.keys())
-        filter_var = tk.StringVar(value='All')
-        combobox = ttk.Combobox(filter_frame, values=status_options, textvariable=filter_var, state='readonly', width=10)
-        combobox.pack(side='left', padx=(5, 0))
+    def _fetch_creation_dates_thread(self, usernames):
+        results = []
+        # Use ThreadPoolExecutor for controlled concurrency
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, max(1, len(usernames)))) as ex:
+            future_to_user = {ex.submit(self._fetch_single_user, u): u for u in usernames}
+            completed = 0
+            for fut in as_completed(future_to_user):
+                user = future_to_user[fut]
+                try:
+                    res = fut.result()
+                except Exception:
+                    res = {'username': user, 'date': 'Unknown', 'year': 'Unknown', 'status': 'active'}
+                results.append(res)
+                completed += 1
+                # update progress bar in main thread
+                self.root.after(0, lambda c=completed: self.progress.config(value=c))
+        # store and update UI
+        self._all_results = sorted(results, key=lambda r: (r['year'] if isinstance(r['year'], int) else 9999, r['username'].lower()))
+        self.root.after(0, self._on_results_ready)
 
-        frame = ttk.Frame(popup, padding=10)
-        frame.pack(fill='both', expand=True)
-        columns = ('Username', 'Status', 'Birth Date', 'Last Activity')
-        tree = ttk.Treeview(frame, columns=columns, show='headings')
-        for col in columns:
-            tree.heading(col, text=col)
-            tree.column(col, anchor='w')
-        scrollbar = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side='right', fill='y')
-        tree.pack(side='left', fill='both', expand=True)
+    def _fetch_single_user(self, username: str) -> dict:
+        """Fetch creation date and status for a single user.
+        Returns a dict: {'username','date','year','status'}
+        """
+        status_code, birth, _ = get_account_info(username)
+        status_label = STATUS_LABELS.get(status_code, 'active')
+        year = 'Unknown'
+        if birth and birth != 'Unknown':
+            try:
+                year = int(birth.split('-')[0])
+            except Exception:
+                year = 'Unknown'
+        return {'username': username, 'date': birth, 'year': year, 'status': status_label}
 
-        all_rows = []
-        for author in authors:
-            code, birth, last = get_account_info(author)
-            all_rows.append((author, STATUS_LABELS.get(code, 'active'), birth, last))
-
-        def populate(status_filter):
-            tree.delete(*tree.get_children())
-            for user, stat, birth, last in all_rows:
-                if status_filter == 'All' or stat == status_filter:
-                    tree.insert('', 'end', values=(user, stat, birth, last))
-        populate('All')
-        combobox.bind('<<ComboboxSelected>>', lambda e: populate(filter_var.get()))
-
-        # sorting and dbl-click as before
-        def sort_column(tv, col, reverse=False):
-            data_list = [(tv.set(child, col), child) for child in tv.get_children('')]
-            if col in ['Birth Date', 'Last Activity']:
-                def parse_date(val):
-                    try: return datetime.datetime.strptime(val, '%Y-%m-%d')
-                    except: return datetime.datetime.min
-                data_list.sort(key=lambda t: parse_date(t[0]), reverse=reverse)
+    def _on_results_ready(self):
+        self.analyze_btn.config(state='normal')
+        self.progress.config(value=0)
+        # compute distribution
+        dist = {}
+        for r in self._all_results:
+            y = r['year']
+            if isinstance(y, int):
+                dist[y] = dist.get(y, 0) + 1
             else:
-                data_list.sort(key=lambda t: t[0].lower(), reverse=reverse)
-            for index, (_, child) in enumerate(data_list):
-                tv.move(child, '', index)
-            tv.heading(col, command=lambda: sort_column(tv, col, not reverse))
-        for col in columns:
-            tree.heading(col, text=col, command=lambda _col=col: sort_column(tree, _col, False))
-        tree.bind('<Double-1>', lambda e: webbrowser.open(f'https://reddit.com/user/{tree.item(tree.selection()[0],"values")[0]}'))
+                dist['Unknown'] = dist.get('Unknown', 0) + 1
+        # populate distribution tree
+        self.dist_tree.delete(*self.dist_tree.get_children())
+        years_sorted = sorted([k for k in dist.keys() if k != 'Unknown'])
+        for y in years_sorted:
+            self.dist_tree.insert('', 'end', values=(y, dist[y]))
+        if 'Unknown' in dist:
+            self.dist_tree.insert('', 'end', values=('Unknown', dist['Unknown']))
 
-    def _build_settings_tab(self, parent):
-        # unchanged settings tab
-        frame = ttk.Frame(parent, padding=10)
-        frame.pack(fill='both', expand=True)
-        ttk.Checkbutton(frame, text='Skip usernames ending with "bot"', variable=self.skip_bots).pack(anchor='w', pady=5)
-        ttk.Label(frame, text='Custom Skip List:').pack(anchor='w')
-        self.skip_listbox = tk.Listbox(frame, height=6)
-        self.skip_listbox.pack(fill='x', pady=5)
-        for item in self.skip_list:
-            self.skip_listbox.insert('end', item)
-        entry_frame = ttk.Frame(frame)
-        entry_frame.pack(fill='x', pady=5)
-        self.new_skip_var = tk.StringVar()
-        ttk.Entry(entry_frame, textvariable=self.new_skip_var).pack(side='left', fill='x', expand=True)
-        ttk.Button(entry_frame, text='Add', command=self._add_skip).pack(side='left', padx=5)
-        ttk.Button(entry_frame, text='Remove Selected', command=self._remove_skip).pack(side='left')
+        # populate year dropdown
+        dropdown_values = ['All'] + [str(y) for y in years_sorted]
+        if 'Unknown' in dist:
+            dropdown_values.append('Unknown')
+        self.year_dropdown.config(values=dropdown_values)
+        self.year_dropdown.set('All')
 
-    def _add_skip(self):
-        val = self.new_skip_var.get().strip()
-        if val and val not in self.skip_list:
-            self.skip_list.append(val)
-            self.skip_listbox.insert('end', val)
-            self.new_skip_var.set('')
-            save_skip_list(self.skip_list)
+        # populate detail tree with all results
+        self._populate_detail_tree(self._all_results)
 
-    def _remove_skip(self):
-        sel = self.skip_listbox.curselection()
-        for i in reversed(sel):
-            val = self.skip_listbox.get(i)
-            self.skip_list.remove(val)
-            self.skip_listbox.delete(i)
-            save_skip_list(self.skip_list)
+    def _populate_detail_tree(self, rows):
+        self.detail_tree.delete(*self.detail_tree.get_children())
+        for r in rows:
+            self.detail_tree.insert('', 'end', values=(r['username'], r['date'], r['status']))
+
+    def _apply_year_filter(self):
+        sel = self.year_var.get()
+        if sel == 'All':
+            filtered = self._all_results
+        elif sel == 'Unknown':
+            filtered = [r for r in self._all_results if r['year'] == 'Unknown']
+        else:
+            try:
+                y = int(sel)
+                filtered = [r for r in self._all_results if r['year'] == y]
+            except Exception:
+                filtered = self._all_results
+        self._populate_detail_tree(filtered)
+
+    def _export_filtered(self):
+        sel = self.year_var.get()
+        if sel == 'All':
+            filtered = self._all_results
+        elif sel == 'Unknown':
+            filtered = [r for r in self._all_results if r['year'] == 'Unknown']
+        else:
+            try:
+                y = int(sel)
+                filtered = [r for r in self._all_results if r['year'] == y]
+            except Exception:
+                filtered = self._all_results
+        if not filtered:
+            messagebox.showinfo('No data', 'No usernames to export for the selected year.')
+            return
+        path = filedialog.asksaveasfilename(defaultextension='.txt', filetypes=[('Text files', '*.txt')])
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                for r in filtered:
+                    f.write(r['username'] + '\n')
+            messagebox.showinfo('Saved', f'Exported {len(filtered)} usernames to {path}')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to save file: {e}')
+
+    def _on_double_click_user(self, event):
+        sel = self.detail_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        username = self.detail_tree.item(item, 'values')[0]
+        if username:
+            webbrowser.open(f'https://reddit.com/user/{username}')
+
 
 if __name__ == '__main__':
     root = tk.Tk()
