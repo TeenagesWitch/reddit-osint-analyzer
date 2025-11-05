@@ -595,7 +595,6 @@ class OverlappingUsersTab(ttk.Frame):
 
         ttk.Button(self, text='Find Overlapping Users', command=self._start_analyze).grid(row=6, column=0, pady=10)
 
-        # Progress bar and status
         progress_frame = ttk.Frame(self)
         progress_frame.grid(row=7, column=0, columnspan=3, sticky='w', pady=(4,4))
         ttk.Label(progress_frame, text='Progress:').pack(side='left', padx=(0,6))
@@ -629,12 +628,13 @@ class OverlappingUsersTab(ttk.Frame):
             var.set(path)
 
     def _extract_usernames(self, path):
+        skip_set = set(DEFAULT_SKIPS)
         usernames = set()
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 for line in f:
                     u = line.strip()
-                    if u and u.lower() not in ('[deleted]', 'automoderator'):
+                    if u and u.lower() not in skip_set and not u.lower().endswith('bot'):
                         usernames.add(u)
         except Exception:
             return set()
@@ -766,7 +766,51 @@ class OverlappingUsersTab(ttk.Frame):
         for index, (_, k) in enumerate(data):
             self.tree.move(k, '', index)
         self.tree.heading(col, command=lambda: self._sort_tree(col, not reverse))
-                
+
+# ---------------------
+# Settings Tab
+# ---------------------
+class SettingsTab(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, padding=10)
+        self.skip_list_path = SKIP_LIST_FILE
+        self._build_ui()
+        self._load_skip_list()
+
+    def _build_ui(self):
+        ttk.Label(self, text='Customize Skip List (usernames to ignore):').pack(anchor='w', pady=(0,8))
+        self.textbox = tk.Text(self, height=15, width=60, wrap='word')
+        self.textbox.pack(fill='both', expand=True)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill='x', pady=8)
+        ttk.Button(btn_frame, text='Save Changes', command=self._save_skip_list).pack(side='left', padx=6)
+        ttk.Button(btn_frame, text='Reload', command=self._load_skip_list).pack(side='left', padx=6)
+        self.status_label = ttk.Label(self, text='')
+        self.status_label.pack(anchor='w', pady=(4,0))
+
+    def _load_skip_list(self):
+        try:
+            with open(self.skip_list_path, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+            self.textbox.delete('1.0', tk.END)
+            self.textbox.insert(tk.END, content)
+            self.status_label.config(text=f'Loaded skip list from {self.skip_list_path}')
+        except Exception as e:
+            self.status_label.config(text=f'Error loading skip list: {e}')
+
+    def _save_skip_list(self):
+        try:
+            content = self.textbox.get('1.0', tk.END).strip()
+            with open(self.skip_list_path, 'w', encoding='utf-8') as f:
+                f.write(content + '\n')
+            global DEFAULT_SKIPS
+            DEFAULT_SKIPS = load_skip_list(self.skip_list_path)
+            self.status_label.config(text='Skip list saved and reloaded.')
+            messagebox.showinfo('Saved', 'Skip list updated successfully.')
+        except Exception as e:
+            messagebox.showerror('Error', f'Failed to save skip list: {e}')
+
 # ---------------------
 # Main App
 # ---------------------
@@ -793,7 +837,10 @@ class MainApp(tk.Tk):
         overlap_tab = OverlappingUsersTab(notebook)
         notebook.add(overlap_tab, text='Overlapping Users')
 
-        # Additional tabs from earlier app can be added here if needed
+        # Tab 4: Settings Tab
+        settings_tab = SettingsTab(notebook)
+        notebook.add(settings_tab, text='Settings')
+
 
 if __name__ == '__main__':
     app = MainApp()
