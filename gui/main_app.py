@@ -8,6 +8,7 @@ from gui.tabs import (
     CreationYearTab,
     OverlappingUsersTab,
     SettingsTab,
+    UserAnalysisTab,
 )
 
 
@@ -36,7 +37,11 @@ class MainApp(tk.Tk):
         overlap_tab = OverlappingUsersTab(notebook)
         notebook.add(overlap_tab, text='Overlapping Users')
 
-        # Tab 4: Settings Tab
+        # Tab 4: User Analysis
+        user_analysis_tab = UserAnalysisTab(notebook)
+        notebook.add(user_analysis_tab, text='User Analysis')
+
+        # Tab 5: Settings Tab
         settings_tab = SettingsTab(notebook)
         notebook.add(settings_tab, text='Settings')
 
