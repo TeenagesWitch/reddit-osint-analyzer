@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from gui.tabs import (
-    UniqueUsernameExtractorTab,
+    SubredditAnalysisTab,
     CreationYearTab,
     OverlappingUsersTab,
     SettingsTab,
@@ -25,9 +25,9 @@ class MainApp(tk.Tk):
         notebook = ttk.Notebook(self)
         notebook.pack(fill='both', expand=True)
 
-        # Tab 1: Unique Extractor (leftmost as requested)
-        extractor_tab = UniqueUsernameExtractorTab(notebook)
-        notebook.add(extractor_tab, text='Unique Username Extractor')
+        # Tab 1: Subreddit Analysis
+        subreddit_tab = SubredditAnalysisTab(notebook)
+        notebook.add(subreddit_tab, text='Subreddit Analysis')
 
         # Tab 2: Creation Year Distribution
         creation_tab = CreationYearTab(notebook)

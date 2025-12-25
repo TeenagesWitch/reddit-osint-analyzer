@@ -26,11 +26,11 @@ class UserAnalysisTab(ttk.Frame):
         file_frame = ttk.Frame(self)
         file_frame.pack(fill='x', pady=(0, 10))
         
-        ttk.Label(file_frame, text='JSONL File A:').grid(row=0, column=0, sticky='w', padx=(0, 5))
+        ttk.Label(file_frame, text='JSONL File A (Posts):').grid(row=0, column=0, sticky='w', padx=(0, 5))
         ttk.Entry(file_frame, textvariable=self.file1_path, width=50).grid(row=0, column=1, padx=(0, 5))
         ttk.Button(file_frame, text='Browse...', command=lambda: self._browse(self.file1_path)).grid(row=0, column=2)
 
-        ttk.Label(file_frame, text='JSONL File B:').grid(row=1, column=0, sticky='w', padx=(0, 5), pady=(5, 0))
+        ttk.Label(file_frame, text='JSONL File B (Comments):').grid(row=1, column=0, sticky='w', padx=(0, 5), pady=(5, 0))
         ttk.Entry(file_frame, textvariable=self.file2_path, width=50).grid(row=1, column=1, padx=(0, 5), pady=(5, 0))
         ttk.Button(file_frame, text='Browse...', command=lambda: self._browse(self.file2_path)).grid(row=1, column=2, pady=(5, 0))
 
@@ -128,6 +128,8 @@ class UserAnalysisTab(ttk.Frame):
                                                textvariable=self.timezone_var, state='readonly', width=20)
         self.timezone_dropdown.pack(side='left', padx=(0, 5))
         self.timezone_map = {tz[0]: tz[1] for tz in timezones}
+        # Initialize timezone to UTC
+        self.selected_timezone = pytz.UTC
         self.timezone_var.trace('w', lambda *args: self._on_timezone_changed())
         
         # Canvas for hour heatmap
@@ -155,21 +157,125 @@ class UserAnalysisTab(ttk.Frame):
                 return None
         return None
 
+    def _validate_jsonl_structure(self, filepath, expected_type):
+        """Validate that JSONL file has the expected structure and extract author.
+        
+        Args:
+            filepath: Path to JSONL file
+            expected_type: 'post' or 'comment'
+        
+        Returns:
+            (is_valid, error_message, author_name) tuple
+        """
+        if not os.path.isfile(filepath):
+            return False, f'File not found: {filepath}', None
+        
+        try:
+            sample_count = 0
+            author_name = None
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    sample_count += 1
+                    
+                    # Extract author name
+                    author = obj.get('author')
+                    if author and author.lower() not in ('[deleted]', 'automoderator'):
+                        if author_name is None:
+                            author_name = author
+                        elif author_name.lower() != author.lower():
+                            return False, f'File is not a valid user JSONL file', None
+                    
+                    if sample_count > 10:  # Check first 10 valid lines
+                        break
+                    
+                    # Check required fields
+                    if not obj.get('author'):
+                        # Author can be missing for deleted posts, but should exist in structure
+                        pass
+                    
+                    if not obj.get('created_utc') and not obj.get('created'):
+                        return False, f'Missing timestamp field in {filepath}', None
+                    
+                    # Check for subreddit field (should exist)
+                    if not obj.get('subreddit') and not obj.get('subreddit_name_prefixed'):
+                        return False, f'Missing subreddit field in {filepath}', None
+                    
+                    # Check type-specific fields
+                    if expected_type == 'post':
+                        # Posts should have 'title' or 'is_self'
+                        if 'title' not in obj and 'is_self' not in obj:
+                            return False, f'File {filepath} does not appear to be a posts file (missing post-specific fields)', None
+                    
+                    elif expected_type == 'comment':
+                        # Comments should have 'body' and 'link_id'
+                        if 'body' not in obj or 'link_id' not in obj:
+                            return False, f'File {filepath} does not appear to be a comments file (missing comment-specific fields)', None
+            
+            if sample_count == 0:
+                return False, f'No valid JSON lines found in {filepath}', None
+            
+            if author_name is None:
+                return False, f'Could not determine author from {filepath}. File may contain only deleted posts/comments.', None
+            
+            return True, None, author_name
+        except Exception as e:
+            return False, f'Error reading {filepath}: {e}', None
+
     def _load_jsonl_files(self):
-        """Load and parse JSONL files."""
+        """Load and parse JSONL files with structure validation."""
         self.subreddit_counts = collections.defaultdict(int)
         self.activity_by_date = collections.defaultdict(int)
         self.activity_by_hour_day = collections.defaultdict(lambda: collections.defaultdict(int))
         self.raw_timestamps = []  # Store raw datetime objects for timezone conversion
 
-        files = []
-        if self.file1_path.get():
-            files.append(self.file1_path.get())
-        if self.file2_path.get():
-            files.append(self.file2_path.get())
+        file1 = self.file1_path.get()
+        file2 = self.file2_path.get()
 
-        if not files:
+        if not file1 or not file2:
             return False
+
+        # Validate file structures and extract authors
+        author1 = None
+        author2 = None
+
+        if file1:
+            is_valid, error_msg, author = self._validate_jsonl_structure(file1, 'post')
+            if not is_valid:
+                messagebox.showerror('Validation Error', f'File A (Posts) validation failed:\n{error_msg}')
+                return False
+            author1 = author
+
+        if file2:
+            is_valid, error_msg, author = self._validate_jsonl_structure(file2, 'comment')
+            if not is_valid:
+                messagebox.showerror('Validation Error', f'File B (Comments) validation failed:\n{error_msg}')
+                return False
+            author2 = author
+
+        # Validate that both files are from the same user
+        if file1 and file2 and author1 and author2:
+            if author1.lower() != author2.lower():
+                messagebox.showerror('Validation Error', 
+                    f'User mismatch:\n'
+                    f'File A is from user: u/{author1}\n'
+                    f'File B is from user: u/{author2}\n\n'
+                    f'Both files must be from the same Reddit user.')
+                return False
+
+        # Process files
+        files = []
+        if file1:
+            files.append(file1)
+        if file2:
+            files.append(file2)
 
         total_lines = 0
         for filepath in files:
@@ -231,8 +337,8 @@ class UserAnalysisTab(ttk.Frame):
         p1 = self.file1_path.get()
         p2 = self.file2_path.get()
         
-        if not p1 and not p2:
-            messagebox.showerror('Error', 'Select at least one JSONL file.')
+        if not p1 or not p2:
+            messagebox.showerror('Error', 'Both JSONL files are required.\nFile A (Posts) and File B (Comments) must be provided.')
             return
 
         if not self._load_jsonl_files():
