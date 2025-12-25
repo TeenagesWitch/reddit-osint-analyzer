@@ -1,6 +1,6 @@
 # Reddit Analyzer
 
-A comprehensive Reddit analysis tool designed for OSINT (Open Source Intelligence) purposes. Analyze subreddit activity, user behavior, account creation patterns, and find overlapping users across multiple datasets.
+A simple Reddit analysis tool designed for OSINT (Open Source Intelligence) purposes. Analyze subreddit activity, user behavior, account creation patterns, and find overlapping users across multiple datasets.
 
 ## Features
 
