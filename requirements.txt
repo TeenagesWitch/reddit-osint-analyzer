@@ -1,0 +1,14 @@
+# Reddit Analyzer Dependencies
+# Python 3.8+ required
+
+# HTTP library for Reddit API requests
+requests>=2.31.0,<3.0.0
+
+# Timezone support for activity heatmaps
+pytz>=2023.3
+
+# Note: tkinter is required but usually comes with Python
+# On Linux, you may need to install: python3-tk
+# On macOS with Homebrew Python: tkinter is included
+# On Windows: tkinter is included with Python
+

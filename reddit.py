@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """
-Author Tools GUI - Integrated
-- Tab 1: Unique Username Extractor (union across two JSONL files; each line = username)
-- Tab 2: Creation Year Distribution (paged, 1000 per page, persistent cache)
+Reddit Analyzer - A comprehensive Reddit analysis tool for OSINT purposes.
 
-Run: requires Python 3.8+ and `requests` installed.
+Features:
+- Subreddit Analysis: Analyze activity and contributors within subreddits
+- User Analysis: Analyze individual Reddit user activity patterns
+- Creation Year Distribution: Analyze account creation year patterns
+- Overlapping Users: Find users present across multiple datasets
+
+Requires Python 3.8+ and dependencies listed in requirements.txt
 """
+
+import sys
+
+# Check Python version
+if sys.version_info < (3, 8):
+    print("Error: Python 3.8 or higher is required.")
+    print(f"Current version: {sys.version}")
+    sys.exit(1)
 
 from gui.main_app import MainApp
 
