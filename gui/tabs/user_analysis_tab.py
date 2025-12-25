@@ -19,22 +19,36 @@ class UserAnalysisTab(ttk.Frame):
         self.subreddit_counts = {}
         self.activity_by_date = {}
         self.activity_by_hour_day = collections.defaultdict(lambda: collections.defaultdict(int))  # {day_of_week: {hour: count}}
+        self.raw_timestamps = []
+        self.total_posts = 0
+        self.total_comments = 0
+        self.username = None
+        self.date_range = None
         self._build_ui()
 
     def _build_ui(self):
-        # File selection at top
-        file_frame = ttk.Frame(self)
-        file_frame.pack(fill='x', pady=(0, 10))
+        # Top section: File selection and Stats side by side
+        top_frame = ttk.Frame(self)
+        top_frame.pack(fill='x', pady=(0, 10))
         
-        ttk.Label(file_frame, text='JSONL File A (Posts):').grid(row=0, column=0, sticky='w', padx=(0, 5))
-        ttk.Entry(file_frame, textvariable=self.file1_path, width=50).grid(row=0, column=1, padx=(0, 5))
-        ttk.Button(file_frame, text='Browse...', command=lambda: self._browse(self.file1_path)).grid(row=0, column=2)
+        # Left side: File inputs
+        input_frame = ttk.Frame(top_frame)
+        input_frame.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        
+        ttk.Label(input_frame, text='JSONL File A (Posts):').grid(row=0, column=0, sticky='w', padx=(0, 5))
+        ttk.Entry(input_frame, textvariable=self.file1_path, width=50).grid(row=0, column=1, padx=(0, 5))
+        ttk.Button(input_frame, text='Browse...', command=lambda: self._browse(self.file1_path)).grid(row=0, column=2)
 
-        ttk.Label(file_frame, text='JSONL File B (Comments):').grid(row=1, column=0, sticky='w', padx=(0, 5), pady=(5, 0))
-        ttk.Entry(file_frame, textvariable=self.file2_path, width=50).grid(row=1, column=1, padx=(0, 5), pady=(5, 0))
-        ttk.Button(file_frame, text='Browse...', command=lambda: self._browse(self.file2_path)).grid(row=1, column=2, pady=(5, 0))
+        ttk.Label(input_frame, text='JSONL File B (Comments):').grid(row=1, column=0, sticky='w', padx=(0, 5), pady=(5, 0))
+        ttk.Entry(input_frame, textvariable=self.file2_path, width=50).grid(row=1, column=1, padx=(0, 5), pady=(5, 0))
+        ttk.Button(input_frame, text='Browse...', command=lambda: self._browse(self.file2_path)).grid(row=1, column=2, pady=(5, 0))
 
-        ttk.Button(file_frame, text='Analyze', command=self._analyze).grid(row=2, column=0, pady=10)
+        ttk.Button(input_frame, text='Analyze', command=self._analyze).grid(row=2, column=0, pady=10)
+
+        # Right side: Stats panel
+        stats_frame = ttk.LabelFrame(top_frame, text='Exploratory Stats', padding=5)
+        stats_frame.pack(side='right', fill='both', expand=False)
+        self._build_stats_view(stats_frame)
 
         # Dashboard layout - main container
         dashboard_frame = ttk.Frame(self)
@@ -59,6 +73,11 @@ class UserAnalysisTab(ttk.Frame):
         hour_frame = ttk.LabelFrame(right_frame, text='Day by Day Posting Hours Heatmap', padding=5)
         hour_frame.pack(fill='both', expand=True, pady=(5, 0))
         self._build_hour_heatmap_view(hour_frame)
+
+    def _build_stats_view(self, parent):
+        """Build the exploratory stats display."""
+        self.stats_text = tk.Text(parent, width=40, height=8, wrap='word', state='disabled', font=('Arial', 9))
+        self.stats_text.pack(fill='both', expand=True)
 
     def _build_subreddit_view(self, parent):
         # Label frame for subreddits
@@ -92,7 +111,7 @@ class UserAnalysisTab(ttk.Frame):
         canvas_frame = ttk.Frame(parent)
         canvas_frame.pack(fill='both', expand=True)
         
-        self.activity_canvas = tk.Canvas(canvas_frame, bg='white', height=250)
+        self.activity_canvas = tk.Canvas(canvas_frame, bg='white', height=175)
         scrollbar_activity_h = ttk.Scrollbar(canvas_frame, orient='horizontal', command=self.activity_canvas.xview)
         scrollbar_activity_v = ttk.Scrollbar(canvas_frame, orient='vertical', command=self.activity_canvas.yview)
         self.activity_canvas.configure(xscrollcommand=scrollbar_activity_h.set, yscrollcommand=scrollbar_activity_v.set)
@@ -235,6 +254,10 @@ class UserAnalysisTab(ttk.Frame):
         self.activity_by_date = collections.defaultdict(int)
         self.activity_by_hour_day = collections.defaultdict(lambda: collections.defaultdict(int))
         self.raw_timestamps = []  # Store raw datetime objects for timezone conversion
+        self.total_posts = 0
+        self.total_comments = 0
+        self.username = None
+        dates_list = []
 
         file1 = self.file1_path.get()
         file2 = self.file2_path.get()
@@ -269,16 +292,16 @@ class UserAnalysisTab(ttk.Frame):
                     f'File B is from user: u/{author2}\n\n'
                     f'Both files must be from the same Reddit user.')
                 return False
+            self.username = author1  # Store username
 
         # Process files
-        files = []
+        files_to_process = []
         if file1:
-            files.append(file1)
+            files_to_process.append((file1, 'post'))
         if file2:
-            files.append(file2)
+            files_to_process.append((file2, 'comment'))
 
-        total_lines = 0
-        for filepath in files:
+        for filepath, file_type in files_to_process:
             if not os.path.isfile(filepath):
                 continue
             try:
@@ -291,6 +314,12 @@ class UserAnalysisTab(ttk.Frame):
                             obj = json.loads(line)
                         except json.JSONDecodeError:
                             continue
+
+                        # Count posts vs comments
+                        if file_type == 'post':
+                            self.total_posts += 1
+                        elif file_type == 'comment':
+                            self.total_comments += 1
 
                         # Extract subreddit
                         subreddit = obj.get('subreddit')
@@ -325,13 +354,15 @@ class UserAnalysisTab(ttk.Frame):
                             # Use UTC for date tracking (date doesn't change with timezone usually)
                             date_key = dt_utc.date()
                             self.activity_by_date[date_key] += 1
-
-                        total_lines += 1
+                            dates_list.append(date_key)
             except Exception as e:
                 messagebox.showerror('Error', f'Failed to read {filepath}: {e}')
                 return False
 
-        return total_lines > 0
+        if dates_list:
+            self.date_range = (min(dates_list), max(dates_list))
+
+        return (self.total_posts + self.total_comments) > 0
 
     def _analyze(self):
         p1 = self.file1_path.get()
@@ -345,7 +376,8 @@ class UserAnalysisTab(ttk.Frame):
             messagebox.showerror('Error', 'Failed to parse JSONL files or no valid data found.')
             return
 
-        # Update subreddit view
+        # Update all views
+        self._update_stats()
         self._update_subreddit_view()
         
         # Update activity tracker (populate year dropdown first)
@@ -355,7 +387,58 @@ class UserAnalysisTab(ttk.Frame):
         # Update hour heatmap view (will use current timezone selection)
         self._update_hour_heatmap()
 
-        messagebox.showinfo('Analysis Complete', f'Analyzed data successfully.')
+        total_activity = self.total_posts + self.total_comments
+        messagebox.showinfo('Analysis Complete', f'Analyzed {total_activity} posts/comments successfully.')
+
+    def _update_stats(self):
+        """Calculate and display exploratory statistics."""
+        self.stats_text.config(state='normal')
+        self.stats_text.delete('1.0', tk.END)
+        
+        total_activity = self.total_posts + self.total_comments
+        if total_activity == 0:
+            self.stats_text.insert('1.0', 'No data available')
+            self.stats_text.config(state='disabled')
+            return
+        
+        # Format stats with line breaks
+        stats_lines = []
+        
+        # Basic stats
+        if self.username:
+            stats_lines.append(f'Username:\nu/{self.username}\n')
+        stats_lines.append(f'Total Posts:\n{self.total_posts:,}\n')
+        stats_lines.append(f'Total Comments:\n{self.total_comments:,}\n')
+        stats_lines.append(f'Total Activity:\n{total_activity:,}\n')
+        stats_lines.append(f'Unique Subreddits:\n{len(self.subreddit_counts):,}\n')
+        
+        # Posts per day (PPD)
+        if self.date_range:
+            days_span = (self.date_range[1] - self.date_range[0]).days + 1
+            ppd = total_activity / days_span if days_span > 0 else 0
+            stats_lines.append(f'Posts per Day (PPD):\n{ppd:.2f}\n')
+            stats_lines.append(f'Date Range:\n{self.date_range[0]} to {self.date_range[1]}\n')
+        
+        # Posts per hour (PPH)
+        if self.date_range:
+            days_span = (self.date_range[1] - self.date_range[0]).days + 1
+            hours_span = days_span * 24 if days_span > 0 else 1
+            pph = total_activity / hours_span if hours_span > 0 else 0
+            stats_lines.append(f'Posts per Hour (PPH):\n{pph:.2f}\n')
+        
+        # Average activity per subreddit
+        if len(self.subreddit_counts) > 0:
+            avg_per_sub = total_activity / len(self.subreddit_counts)
+            stats_lines.append(f'Avg Activity per Sub:\n{avg_per_sub:.2f}\n')
+        
+        # Posts vs Comments ratio
+        if self.total_comments > 0:
+            post_ratio = (self.total_posts / total_activity) * 100
+            comment_ratio = (self.total_comments / total_activity) * 100
+            stats_lines.append(f'Posts: {post_ratio:.1f}%\nComments: {comment_ratio:.1f}%\n')
+                
+        self.stats_text.insert('1.0', '\n'.join(stats_lines))
+        self.stats_text.config(state='disabled')
 
     def _update_subreddit_view(self):
         # Clear existing items

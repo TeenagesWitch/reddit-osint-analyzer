@@ -139,7 +139,7 @@ class SubredditAnalysisTab(ttk.Frame):
         canvas_frame = ttk.Frame(parent)
         canvas_frame.pack(fill='both', expand=True)
         
-        self.activity_canvas = tk.Canvas(canvas_frame, bg='white', height=250)
+        self.activity_canvas = tk.Canvas(canvas_frame, bg='white', height=175)
         scrollbar_activity_h = ttk.Scrollbar(canvas_frame, orient='horizontal', command=self.activity_canvas.xview)
         scrollbar_activity_v = ttk.Scrollbar(canvas_frame, orient='vertical', command=self.activity_canvas.yview)
         self.activity_canvas.configure(xscrollcommand=scrollbar_activity_h.set, yscrollcommand=scrollbar_activity_v.set)

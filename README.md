@@ -42,6 +42,15 @@ Analyze individual Reddit user activity patterns across multiple subreddits.
 - User can have activity across multiple subreddits
 
 **Features:**
+- **Exploratory Statistics**:
+  - Username
+  - Total posts and comments count
+  - Posts vs comments ratio (percentage breakdown)
+  - Unique subreddits count
+  - Posts per Day (PPD)
+  - Posts per Hour (PPH)
+  - Date range of activity
+  - Average activity per subreddit
 - **Subreddit Frequency List**: View all subreddits the user participates in, sorted by activity frequency
 - **Activity Tracker**: GitHub-style contribution calendar
   - Filter by year
