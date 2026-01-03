@@ -99,7 +99,7 @@ Configuration and application settings.
 
 ### JSONL Files (Subreddit Analysis & User Analysis)
 
-Each line must be a valid JSON object representing a Reddit post or comment.
+Each line must be a valid JSON object representing a Reddit post or comment. They can be obtained from [arctic-shift](https://arctic-shift.photon-reddit.com/).
 
 **Post objects should contain:**
 - `subreddit` or `subreddit_name_prefixed`
